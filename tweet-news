@@ -1,0 +1,107 @@
+/* ════════════════════════════════════════════════════════════════
+   Tweet Studio — News API  (Cloudflare Worker)
+   Scrapes India news SERVER-SIDE (no CORS limits) and returns JSON.
+   Deploy free at cloudflare.com → Workers → Create → paste → Deploy.
+   Then call:  https://YOUR-WORKER.workers.dev/api/news?niche=finance
+════════════════════════════════════════════════════════════════ */
+
+const NICHES = {
+  trending: { gdelt:'india sourcecountry:IN',
+    rss:'https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en' },
+  topnews:  { gdelt:'(india OR modi OR delhi OR mumbai) sourcecountry:IN',
+    rss:'https://news.google.com/rss/search?q=india+news+when:1d&hl=en-IN&gl=IN&ceid=IN:en' },
+  finance:  { gdelt:'(sensex OR nifty OR "stock market" OR RBI OR rupee) sourcecountry:IN',
+    rss:'https://news.google.com/rss/search?q=(sensex%20OR%20nifty%20OR%20NSE%20OR%20RBI)%20india%20when:1d&hl=en-IN&gl=IN&ceid=IN:en' },
+  tech:     { gdelt:'(technology OR "artificial intelligence" OR software) sourcecountry:IN',
+    rss:'https://news.google.com/rss/search?q=(AI%20OR%20technology%20OR%20startup)%20india%20when:1d&hl=en-IN&gl=IN&ceid=IN:en' },
+  cricket:  { gdelt:'(cricket OR BCCI OR IPL) sourcecountry:IN',
+    rss:'https://news.google.com/rss/search?q=(cricket%20OR%20BCCI%20OR%20IPL)%20when:1d&hl=en-IN&gl=IN&ceid=IN:en' },
+  startups: { gdelt:'(startup OR funding OR unicorn) sourcecountry:IN',
+    rss:'https://news.google.com/rss/search?q=(startup%20OR%20funding%20OR%20unicorn)%20india%20when:1d&hl=en-IN&gl=IN&ceid=IN:en' },
+  bollywood:{ gdelt:'(bollywood OR "box office" OR "hindi film") sourcecountry:IN',
+    rss:'https://news.google.com/rss/search?q=(bollywood%20OR%20%22box%20office%22%20OR%20OTT)%20when:1d&hl=en-IN&gl=IN&ceid=IN:en' },
+};
+
+const CORS = {
+  'Access-Control-Allow-Origin':'*',
+  'Access-Control-Allow-Methods':'GET,OPTIONS',
+  'Access-Control-Allow-Headers':'*',
+};
+const DAY = 86400000;
+
+export default {
+  async fetch(req) {
+    const url = new URL(req.url);
+    if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
+    if (url.pathname === '/api/news') {
+      const niche = (url.searchParams.get('niche') || 'trending').toLowerCase();
+      const data = await getNews(niche);
+      return json(data);
+    }
+    return new Response('Tweet Studio API running ✅  Try /api/news?niche=finance',
+      { headers: { ...CORS, 'content-type':'text/plain' } });
+  }
+};
+
+function json(o){ return new Response(JSON.stringify(o), { headers:{ ...CORS, 'content-type':'application/json' } }); }
+
+async function getNews(niche){
+  const n = NICHES[niche] || NICHES.trending;
+
+  /* 1) GDELT (clean JSON, indexes Indian outlets) */
+  try {
+    const u = 'https://api.gdeltproject.org/api/v2/doc/doc?mode=artlist&format=json&maxrecords=40&sort=datedesc&timespan=24h&query=' + encodeURIComponent(n.gdelt);
+    const r = await fetch(u, { headers:{ 'User-Agent':'Mozilla/5.0' }, cf:{ cacheTtl: 300 } });
+    if (r.ok) {
+      const j = await r.json();
+      const items = dedupe((j.articles||[])
+        .map(a=>({ title:stripSrc(decode(a.title||'')), source:(a.domain||'').replace(/^www\./,''), ms:gdate(a.seendate) }))
+        .filter(x=>x.title && x.ms && (Date.now()-x.ms)<DAY)
+        .sort((a,b)=>b.ms-a.ms))
+        .slice(0,25)
+        .map(x=>({ title:x.title, source:x.source, hoursAgo:Math.max(0,(Date.now()-x.ms)/3600000) }));
+      if (items.length) return { ok:true, mode:'GDELT', niche, items };
+    }
+  } catch(e){}
+
+  /* 2) Google News RSS fallback (parsed with regex, server-side) */
+  try {
+    const r = await fetch(n.rss, { headers:{ 'User-Agent':'Mozilla/5.0 (compatible; TweetStudio/1.0)', 'Accept-Language':'en-IN,en;q=0.9' }, cf:{ cacheTtl: 300 } });
+    if (r.ok) {
+      const xml = await r.text();
+      const items = parseRSS(xml)
+        .filter(x=>x.ms && (Date.now()-x.ms)<DAY)
+        .sort((a,b)=>b.ms-a.ms)
+        .slice(0,25)
+        .map(x=>({ title:x.title, source:x.source, hoursAgo:Math.max(0,(Date.now()-x.ms)/3600000) }));
+      if (items.length) return { ok:true, mode:'Google News', niche, items };
+    }
+  } catch(e){}
+
+  return { ok:false, mode:'none', niche, items:[], error:'Sources returned nothing fresh — try again in a moment.' };
+}
+
+/* ── helpers ── */
+function pick(s,re){ const m=s.match(re); return m?m[1]:''; }
+function decode(s){ return (s||'')
+  .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g,'$1')
+  .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+  .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g,' ')
+  .replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
+function stripSrc(t){ return (t||'').replace(/\s[-–—|]\s[^-–—|]{2,70}$/,'').trim(); }
+function gdate(s){ const m=String(s||'').match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/); return m?Date.parse(m[1]+'-'+m[2]+'-'+m[3]+'T'+m[4]+':'+m[5]+':'+m[6]+'Z'):0; }
+function dedupe(items){ const seen=new Set(); return items.filter(x=>{ const k=x.title.toLowerCase().slice(0,55); if(seen.has(k)) return false; seen.add(k); return true; }); }
+function parseRSS(xml){
+  const out=[];
+  const blocks = xml.split(/<item[ >]/i).slice(1);
+  for (const b of blocks){
+    const seg = b.split(/<\/item>/i)[0];
+    const title = decode(pick(seg,/<title>([\s\S]*?)<\/title>/i));
+    const pub   = pick(seg,/<pubDate>([\s\S]*?)<\/pubDate>/i).trim();
+    const src   = decode(pick(seg,/<source[^>]*>([\s\S]*?)<\/source>/i));
+    const ms    = pub ? Date.parse(pub) : 0;
+    if (title) out.push({ title:stripSrc(title), source:src, ms });
+  }
+  return out;
+}
+
